@@ -1,0 +1,31 @@
+name: ffmpeg-release
+
+on:
+  workflow_dispatch:
+    inputs:
+      ffmpeg_ref:
+        description: FFmpeg git tag to build for every platform (e.g. n8.1.2)
+        required: true
+        default: n8.1.2
+
+permissions:
+  contents: write
+
+jobs:
+  macos:
+    uses: ./.github/workflows/ffmpeg-macos-lgpl.yml
+    with:
+      ffmpeg_ref: ${{ inputs.ffmpeg_ref }}
+    secrets: inherit
+
+  linux:
+    uses: ./.github/workflows/ffmpeg-linux-lgpl.yml
+    with:
+      ffmpeg_ref: ${{ inputs.ffmpeg_ref }}
+    secrets: inherit
+
+  windows:
+    uses: ./.github/workflows/ffmpeg-windows-lgpl.yml
+    with:
+      ffmpeg_ref: ${{ inputs.ffmpeg_ref }}
+    secrets: inherit

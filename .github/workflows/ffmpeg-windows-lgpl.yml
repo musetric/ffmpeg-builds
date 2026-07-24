@@ -1,0 +1,105 @@
+name: ffmpeg-windows-lgpl
+
+on:
+  workflow_dispatch:
+    inputs:
+      ffmpeg_ref:
+        description: FFmpeg git tag to build (e.g. n8.1.2)
+        required: true
+        default: n8.1.2
+  workflow_call:
+    inputs:
+      ffmpeg_ref:
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            triple: x86_64-w64-mingw32
+            ffarch: x86_64
+          - arch: arm64
+            triple: aarch64-w64-mingw32
+            ffarch: aarch64
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      TAG: ffmpeg-${{ inputs.ffmpeg_ref }}
+      ASSET: ffmpeg-lgpl-windows-${{ matrix.arch }}.tar.gz
+    steps:
+      - name: Install build tools
+        run: sudo apt-get update && sudo apt-get install -y nasm jq
+
+      - name: Install llvm-mingw toolchain
+        run: |
+          url=$(curl -fsSL https://api.github.com/repos/mstorsjo/llvm-mingw/releases/latest \
+            | jq -r '.assets[].browser_download_url' \
+            | grep -E 'ucrt-ubuntu-[0-9.]+-x86_64\.tar\.xz$' | head -1)
+          echo "Using $url"
+          curl -fsSL -o llvm-mingw.tar.xz "$url"
+          tar -xf llvm-mingw.tar.xz
+          echo "$PWD/$(ls -d llvm-mingw-*/)bin" >> "$GITHUB_PATH"
+
+      - name: Clone FFmpeg ${{ inputs.ffmpeg_ref }}
+        run: git clone --depth 1 --branch "${{ inputs.ffmpeg_ref }}" https://github.com/FFmpeg/FFmpeg.git ffmpeg
+
+      - name: Configure (LGPL, static cross-compile, no external libs)
+        working-directory: ffmpeg
+        run: |
+          ./configure \
+            --prefix="$PWD/out" \
+            --enable-cross-compile --cross-prefix=${{ matrix.triple }}- \
+            --target-os=mingw32 --arch=${{ matrix.ffarch }} \
+            --enable-static --disable-shared --disable-autodetect \
+            --disable-doc --disable-htmlpages --disable-manpages --disable-txtpages \
+            --disable-ffplay --disable-debug --disable-network \
+            --extra-ldflags="-static"
+
+      - name: Assert LGPL (no GPL/nonfree component enabled)
+        working-directory: ffmpeg
+        run: |
+          if grep -q '#define CONFIG_GPL 1' config.h; then echo "::error::GPL enabled"; exit 1; fi
+          if grep -q '#define CONFIG_NONFREE 1' config.h; then echo "::error::nonfree enabled"; exit 1; fi
+          echo "Confirmed LGPL build."
+
+      - name: Build ffmpeg.exe + ffprobe.exe
+        working-directory: ffmpeg
+        run: make -j"$(nproc)"
+
+      - name: Verify target and static runtime linkage
+        working-directory: ffmpeg
+        run: |
+          file ffmpeg.exe ffprobe.exe
+          for bin in ffmpeg.exe ffprobe.exe; do
+            dlls=$(llvm-objdump -p "$bin" | awk '/DLL Name:/ {print tolower($3)}')
+            echo "$bin imports: $dlls"
+            if echo "$dlls" | grep -qE 'libc\+\+|libunwind|libwinpthread|libssp|libgcc'; then
+              echo "::error::$bin depends on a non-static runtime DLL"; exit 1
+            fi
+          done
+
+      - name: Package
+        working-directory: ffmpeg
+        run: |
+          mkdir dist
+          cp ffmpeg.exe ffprobe.exe dist/
+          cp COPYING.LGPLv2.1 dist/LICENSE.txt
+          cd dist
+          tar -czf "$ASSET" ffmpeg.exe ffprobe.exe LICENSE.txt
+          shasum -a 256 "$ASSET" | tee "$ASSET.sha256"
+
+      - name: Publish to release
+        working-directory: ffmpeg/dist
+        run: |
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
+            --title "FFmpeg ${{ inputs.ffmpeg_ref }} (LGPL)" \
+            --notes "LGPL static ffmpeg/ffprobe built from FFmpeg ${{ inputs.ffmpeg_ref }} with --disable-gpl and no external libraries." \
+            2>/dev/null || true
+          gh release upload "$TAG" "$ASSET" "$ASSET.sha256" --repo "$GITHUB_REPOSITORY" --clobber

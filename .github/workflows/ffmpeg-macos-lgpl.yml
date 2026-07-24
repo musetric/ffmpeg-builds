@@ -1,0 +1,107 @@
+name: ffmpeg-macos-lgpl
+
+on:
+  workflow_dispatch:
+    inputs:
+      ffmpeg_ref:
+        description: FFmpeg git tag to build (e.g. n8.1.2)
+        required: true
+        default: n8.1.2
+      min_macos:
+        description: Minimum macOS version
+        required: true
+        default: '11.0'
+  workflow_call:
+    inputs:
+      ffmpeg_ref:
+        required: true
+        type: string
+      min_macos:
+        required: false
+        type: string
+        default: '11.0'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-14
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            cc_arch: arm64
+            cross: ''
+          - arch: x64
+            cc_arch: x86_64
+            cross: '--enable-cross-compile --arch=x86_64'
+    env:
+      MACOSX_DEPLOYMENT_TARGET: ${{ inputs.min_macos }}
+      HOMEBREW_NO_REQUIRE_TAP_TRUST: '1'
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      TAG: ffmpeg-${{ inputs.ffmpeg_ref }}
+      ASSET: ffmpeg-lgpl-macos-${{ matrix.arch }}.tar.gz
+    steps:
+      - name: Install build tools
+        run: brew install nasm
+
+      - name: Clone FFmpeg ${{ inputs.ffmpeg_ref }}
+        run: git clone --depth 1 --branch "${{ inputs.ffmpeg_ref }}" https://github.com/FFmpeg/FFmpeg.git ffmpeg
+
+      - name: Configure (LGPL, static, ${{ matrix.arch }})
+        working-directory: ffmpeg
+        run: |
+          ./configure \
+            --prefix="$PWD/out" \
+            ${{ matrix.cross }} \
+            --cc="clang -arch ${{ matrix.cc_arch }}" \
+            --enable-static --disable-shared --disable-autodetect \
+            --disable-doc --disable-htmlpages --disable-manpages --disable-txtpages \
+            --disable-ffplay --disable-debug --disable-network \
+            --extra-cflags="-arch ${{ matrix.cc_arch }} -mmacosx-version-min=${MACOSX_DEPLOYMENT_TARGET}" \
+            --extra-ldflags="-arch ${{ matrix.cc_arch }} -mmacosx-version-min=${MACOSX_DEPLOYMENT_TARGET}"
+
+      - name: Assert LGPL (no GPL/nonfree component enabled)
+        working-directory: ffmpeg
+        run: |
+          if grep -q '#define CONFIG_GPL 1' config.h; then echo "::error::GPL enabled"; exit 1; fi
+          if grep -q '#define CONFIG_NONFREE 1' config.h; then echo "::error::nonfree enabled"; exit 1; fi
+          echo "Confirmed LGPL build."
+
+      - name: Build ffmpeg + ffprobe
+        working-directory: ffmpeg
+        run: make -j"$(sysctl -n hw.ncpu)" ffmpeg ffprobe
+
+      - name: Verify system-only linkage (and run when native)
+        working-directory: ffmpeg
+        run: |
+          for bin in ffmpeg ffprobe; do
+            file "$bin"
+            extra=$(otool -L "$bin" | tail -n +2 | awk '{print $1}' | grep -vE '^(/usr/lib/|/System/)' || true)
+            if [ -n "$extra" ]; then echo "::error::$bin links non-system libraries:"; echo "$extra"; exit 1; fi
+          done
+          if [ "${{ matrix.arch }}" = "arm64" ]; then
+            ./ffmpeg -hide_banner -version
+            ./ffprobe -hide_banner -version
+          fi
+
+      - name: Package
+        working-directory: ffmpeg
+        run: |
+          mkdir dist
+          cp ffmpeg ffprobe dist/
+          cp COPYING.LGPLv2.1 dist/LICENSE.txt
+          cd dist
+          tar -czf "$ASSET" ffmpeg ffprobe LICENSE.txt
+          shasum -a 256 "$ASSET" | tee "$ASSET.sha256"
+
+      - name: Publish to release
+        working-directory: ffmpeg/dist
+        run: |
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
+            --title "FFmpeg ${{ inputs.ffmpeg_ref }} (LGPL)" \
+            --notes "LGPL static ffmpeg/ffprobe built from FFmpeg ${{ inputs.ffmpeg_ref }} with --disable-gpl and no external libraries." \
+            2>/dev/null || true
+          gh release upload "$TAG" "$ASSET" "$ASSET.sha256" --repo "$GITHUB_REPOSITORY" --clobber

@@ -1,0 +1,90 @@
+name: ffmpeg-linux-lgpl
+
+on:
+  workflow_dispatch:
+    inputs:
+      ffmpeg_ref:
+        description: FFmpeg git tag to build (e.g. n8.1.2)
+        required: true
+        default: n8.1.2
+  workflow_call:
+    inputs:
+      ffmpeg_ref:
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch: x64
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      TAG: ffmpeg-${{ inputs.ffmpeg_ref }}
+      ASSET: ffmpeg-lgpl-linux-${{ matrix.arch }}.tar.gz
+    steps:
+      - name: Install build tools
+        run: sudo apt-get update && sudo apt-get install -y nasm
+
+      - name: Clone FFmpeg ${{ inputs.ffmpeg_ref }}
+        run: git clone --depth 1 --branch "${{ inputs.ffmpeg_ref }}" https://github.com/FFmpeg/FFmpeg.git ffmpeg
+
+      - name: Configure (LGPL, fully static, no external libs)
+        working-directory: ffmpeg
+        run: |
+          ./configure \
+            --prefix="$PWD/out" \
+            --enable-static --disable-shared --disable-autodetect \
+            --disable-doc --disable-htmlpages --disable-manpages --disable-txtpages \
+            --disable-ffplay --disable-debug --disable-network \
+            --extra-ldflags="-static"
+
+      - name: Assert LGPL (no GPL/nonfree component enabled)
+        working-directory: ffmpeg
+        run: |
+          if grep -q '#define CONFIG_GPL 1' config.h; then echo "::error::GPL enabled"; exit 1; fi
+          if grep -q '#define CONFIG_NONFREE 1' config.h; then echo "::error::nonfree enabled"; exit 1; fi
+          echo "Confirmed LGPL build."
+
+      - name: Build ffmpeg + ffprobe
+        working-directory: ffmpeg
+        run: make -j"$(nproc)" ffmpeg ffprobe
+
+      - name: Verify fully static and that binaries run
+        working-directory: ffmpeg
+        run: |
+          for bin in ffmpeg ffprobe; do
+            if ! ldd "$bin" 2>&1 | grep -q 'not a dynamic executable'; then
+              echo "::error::$bin is not fully static:"; ldd "$bin"; exit 1
+            fi
+          done
+          ./ffmpeg -hide_banner -version
+          ./ffprobe -hide_banner -version
+
+      - name: Package
+        working-directory: ffmpeg
+        run: |
+          mkdir dist
+          cp ffmpeg ffprobe dist/
+          cp COPYING.LGPLv2.1 dist/LICENSE.txt
+          cd dist
+          tar -czf "$ASSET" ffmpeg ffprobe LICENSE.txt
+          shasum -a 256 "$ASSET" | tee "$ASSET.sha256"
+
+      - name: Publish to release
+        working-directory: ffmpeg/dist
+        run: |
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
+            --title "FFmpeg ${{ inputs.ffmpeg_ref }} (LGPL)" \
+            --notes "LGPL static ffmpeg/ffprobe built from FFmpeg ${{ inputs.ffmpeg_ref }} with --disable-gpl and no external libraries." \
+            2>/dev/null || true
+          gh release upload "$TAG" "$ASSET" "$ASSET.sha256" --repo "$GITHUB_REPOSITORY" --clobber

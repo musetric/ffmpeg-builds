@@ -1,0 +1,15 @@
+# OS
+.DS_Store
+Thumbs.db
+
+# Editors
+.vscode/
+.idea/
+
+# Local build output (CI clones ffmpeg/ and produces these; never commit them)
+/ffmpeg/
+/llvm-mingw*/
+dist/
+*.zip
+*.tar.xz
+*.sha256
